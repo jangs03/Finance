@@ -1,0 +1,80 @@
+# T5 — vectorizer ablation (w4-2 p23~26: 표현 방식과 어휘 가지치기는 "모델링 선택"이므로 보고)
+# 질문: 대표 제목(titles_r1)을 어떤 방식으로 벡터화해야 "급등락 확률"을 가장 잘 학습하는가, 그리고 그것이 갭 위에 더하는가
+# 방법: 같은 로지스틱 회귀 + 같은 삼분위 배율, vectorizer 만 바꿈. 기준선 = B2 (텍스트 없음)
+#       lm_vocab 은 LM 사전이 있어야 함, finbert_emb 는 Colab 결과가 있어야 함 → 준비되면 아래 주석을 풀 것
+# 실행: python -m exp run configs/t5_vectorizer.toml
+#       python -m exp explain configs/t5_vectorizer.toml --candidate tfidf_uni   (단어 계수 상·하위)
+
+name = "t5_vectorizer_lm"
+stage = "T5"
+seed = 20261005
+
+[data]
+groups = ["core", "regime", "txt_count", "txt_meta", "txt_text"]
+research = []
+
+[eval]
+baseline = "B2"
+
+[adopt]
+multiplicity = "holm"
+family_size = 23              # T1~T5 비기준선 후보 수 (T5 주석 2개 포함)
+
+[[candidates]]
+name = "B2"
+signal = { type = "gap" }
+decision = { type = "k" }
+
+[[candidates]]
+name = "count_uni"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "text", vectorizer = "count_uni" } }
+
+[[candidates]]
+name = "tfidf_uni"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "text", vectorizer = "tfidf_uni" } }
+
+[[candidates]]
+name = "tfidf_bi"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "text", vectorizer = "tfidf_bi" } }
+
+[[candidates]]
+name = "tfidf_char"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "text", vectorizer = "tfidf_char" } }
+
+[[candidates]]
+name = "tfidf_stop"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "text", vectorizer = "tfidf_stop" } }
+
+[[candidates]]
+name = "tfidf_df"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "text", vectorizer = "tfidf_df" } }
+
+[[candidates]]
+name = "hashing"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "text", vectorizer = "hashing" } }
+
+[[candidates]]
+name = "lm_vocab"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "text", vectorizer = "lm_vocab" } }
+
+# [[candidates]]
+# name = "finbert_emb"
+# signal = { type = "gap" }
+# decision = { type = "k" }
+# regime = { type = "textclf", params = { input = "columns", columns = ["finbert_emb"] } }

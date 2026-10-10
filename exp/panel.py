@@ -12,6 +12,7 @@
 import functools
 import hashlib
 import json
+from tkinter.font import names
 
 import numpy as np
 import pandas as pd
@@ -100,9 +101,13 @@ def _attach_research(x, names):
         x = x.merge(act.reset_index(), on="target", how="left")
     if {"finbert", "finbert_emb"} & set(names):
         from .text import finbert_features
-        fb = finbert_features(sorted(x["symbol"].unique()))
-        if len(fb.columns) > 2:
-            x = x.merge(fb, on=key, how="left")
+        include_embeddings = "finbert_emb" in names
+        fb = finbert_features(
+            sorted(x["symbol"].unique()),
+            include_embeddings=include_embeddings
+        )
+    if len(fb.columns) > 2:
+        x = x.merge(fb, on=key, how="left")
     for name, fname in LLM_FILES.items():
         if name in names:
             path = CACHE / fname

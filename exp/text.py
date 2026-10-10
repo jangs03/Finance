@@ -129,23 +129,52 @@ def import_finbert(path):
 # input : universe (종목 목록)
 # output: DataFrame[symbol, target, fb_*]  (FinBERT 결과가 없으면 빈 표)
 # -----------------------------------------------------------------------------
-def finbert_features(universe):
+def finbert_features(universe, include_embeddings=True):
     if not FINBERT_SCORES.exists():
         print(f"[text] {FINBERT_SCORES.name} 없음. Colab 실행 후 python -m exp text import-finbert <파일>")
         return pd.DataFrame(columns=["symbol", "target"])
-    sc = pd.read_parquet(FINBERT_SCORES)
+
+    cols = ["title_id", "p_pos", "p_neg", "p_neu"]
+
+    if include_embeddings:
+        import pyarrow.parquet as pq
+        schema = pq.read_schema(FINBERT_SCORES)
+        emb = sorted(
+            [c for c in schema.names if c.startswith("emb_")],
+            key=lambda c: int(c.split("_")[1])
+        )
+        cols += emb
+    else:
+        emb = []
+
+    sc = pd.read_parquet(FINBERT_SCORES, columns=cols)
     r = _reps(articles())
     r = r[r["symbol"].isin(set(universe))].merge(sc, on="title_id", how="inner")
+
     r["net"] = r["p_pos"] - r["p_neg"]
-    r["neg"] = (r[["p_pos", "p_neg", "p_neu"]].idxmax(axis=1) == "p_neg").astype(float)
+    r["neg"] = (
+        r[["p_pos", "p_neg", "p_neu"]].idxmax(axis=1) == "p_neg"
+    ).astype(float)
+
     k = ["symbol", "target"]
-    out = r.groupby(k).agg(fb_net_r1=("net", "mean"), fb_neg_share_r1=("neg", "mean"), fb_n_r1=("net", "size"))
-    emb = sorted([c for c in sc.columns if c.startswith("emb_")], key=lambda c: int(c.split("_")[1]))
+    out = r.groupby(k).agg(
+        fb_net_r1=("net", "mean"),
+        fb_neg_share_r1=("neg", "mean"),
+        fb_n_r1=("net", "size")
+    )
+
     if emb:
         comp, mean = _pca(sc, emb)
         z = (r[emb].to_numpy(np.float32) - mean) @ comp.T
-        zc = pd.DataFrame(z, columns=[f"fb_pc{i}" for i in range(comp.shape[0])], index=r.index)
-        out = out.join(pd.concat([r[k], zc], axis=1).groupby(k).mean())
+        zc = pd.DataFrame(
+            z,
+            columns=[f"fb_pc{i}" for i in range(comp.shape[0])],
+            index=r.index
+        )
+        out = out.join(
+            pd.concat([r[k], zc], axis=1).groupby(k).mean()
+        )
+
     return out.reset_index()
 
 

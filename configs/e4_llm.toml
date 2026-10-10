@@ -12,8 +12,8 @@ model = "claude-opus-5-5"
 effort = "low"                   # 짧은 분류 작업이라 low
 dry_run = true
 max_calls = 200                  # 이번 실행에서 새로 부를 최대 호출 수 (캐시 적중은 세지 않음)
-kinds = ["news"]                 # "reddit" 추가 가능
+kinds = ["reddit"]                 # "reddit" 추가 가능
 variants = ["anon", "raw"]       # 누수 비교: 익명 입력 vs 원문 입력
 n_per_stratum = 50               # |갭| 3층 × 부호 2 = 6칸 × 50 = 뉴스 300건 (변형마다)
 reddit_sub = "stocks"
-reddit_n = 300
+reddit_n = 30

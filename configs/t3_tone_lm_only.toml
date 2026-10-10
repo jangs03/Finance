@@ -1,0 +1,52 @@
+# T3 — 톤 3세대 비교: GDELT(일반 사전) · LM(금융 사전) · FinBERT(연구용)
+# 질문: 톤이 count 위에 크기 정보를 더하는가 (w5-1 p39: 모든 감성 feature 는 count 와 비교)
+# 방법: 텍스트 분류기(textclf, input="columns")가 "급등락 확률"을 학습 → 그 삼분위로 갭 신호 배율
+#       기준선 = count 열만 쓴 같은 구조. 후보 = count + 톤 묶음 (집계 규칙 2개 + 분산이 묶음 안에 있음)
+# LM 은 resources/ 에 LM 사전 CSV 를 두고 python -m exp text resources 를 먼저 실행해야 값이 생김
+# FinBERT 는 Colab 결과를 가져온 뒤에만 의미가 있음 (python -m exp text import-finbert ...)
+# 실행: python -m exp run configs/t3_tone.toml
+
+name = "t3_tone_lm_only"
+stage = "T3"
+seed = 20261005
+
+[data]
+groups = ["core", "regime", "txt_count", "txt_tone_gdelt", "txt_tone_lm", "txt_meta"]
+research = []
+
+[eval]
+baseline = "count"
+
+[adopt]
+multiplicity = "holm"
+family_size = 23              # T1~T5 비기준선 후보 수 (T5 주석 2개 포함)
+
+[[candidates]]
+name = "count"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "columns", columns = ["n_first_r1_abn", "n_clu_r1_abn", "n_scored_r1"] } }
+
+[[candidates]]
+name = "count+gdelt"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "columns", columns = ["n_first_r1_abn", "n_clu_r1_abn", "n_scored_r1", "txt_tone_gdelt"] } }
+
+[[candidates]]
+name = "count+lm"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "columns", columns = ["n_first_r1_abn", "n_clu_r1_abn", "n_scored_r1", "txt_tone_lm"] } }
+
+#[[candidates]]
+#name = "count+finbert"
+#signal = { type = "gap" }
+#decision = { type = "k" }
+#regime = { type = "textclf", params = { input = "columns", columns = ["n_first_r1_abn", "n_clu_r1_abn", "n_scored_r1", "finbert"] } }
+
+[[candidates]]
+name = "count+gdelt+lm"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "columns", columns = ["n_first_r1_abn", "n_clu_r1_abn", "n_scored_r1", "txt_tone_gdelt", "txt_tone_lm"] } }

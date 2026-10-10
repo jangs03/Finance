@@ -113,7 +113,8 @@ def _dev_panel(cfg):
 #         (종목, 대상일)마다 가장 많이 재게시된 클러스터의 첫 제목을 대표로 고름
 #         |gap| 층 (small < 0.5, medium < 1.5, large ≥ 1.5 %) × 갭 부호 6칸에서 n_per_stratum 개씩 무작위 추출
 # input : cfg [llm] n_per_stratum, seed
-# output: DataFrame[symbol, target, title, gap_pct, stratum]
+#         max_calls는 신규 item 처리 수 기준이며 retry 횟수는 별도
+# output: DataFrame[symbol, target, text]  (universe ticker가 하나만 언급된 댓글만 사용)
 # -----------------------------------------------------------------------------
 def sample_news(cfg):
     from .text import articles, lockbox_safe
@@ -142,29 +143,270 @@ def sample_reddit(cfg):
     import sys
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
+
     sys.path.insert(0, str(C.ROOT / "eda"))
     import eda_utils as E
 
     L = cfg["llm"]
+
     syms = sorted(load_tables()["daily"]["symbol"].unique())
     pre, rx = E.ticker_patterns(syms)
-    pf = pq.ParquetFile(C.ROOT / "dataset" / "reddit" / f"{L.get('reddit_sub', 'stocks')}.comments.parquet")
-    rng = np.random.default_rng(C.derive_seed(cfg["seed"], "llm_reddit"))
-    lb, cal, want, rows = pd.Timestamp(cfg["split"]["lockbox_start"]), calendar(), int(L.get("reddit_n", 300)), []
+
+    pf = pq.ParquetFile(
+        C.ROOT
+        / "dataset"
+        / "reddit"
+        / f"{L.get('reddit_sub', 'stocks')}.comments.parquet"
+    )
+
+    rng = np.random.default_rng(
+        C.derive_seed(cfg["seed"], "llm_reddit")
+    )
+
+    lb = pd.Timestamp(cfg["split"]["lockbox_start"])
+    cal = calendar()
+
+    want = int(L.get("reddit_n", 300))
+
+    # 너무 많이 메모리에 올리지 않기 위한 후보 pool
+    pool_target = max(want * 5, 1000)
+
+    rows = []
+
+    # -------------------------------------------------------------------------
+    # 1. ticker 언급 Reddit 댓글 후보 수집
+    # -------------------------------------------------------------------------
     for i in rng.permutation(pf.num_row_groups):
-        t = pf.read_row_group(int(i), columns=["created_et", "body"])
-        hit = pc.fill_null(pc.match_substring_regex(pc.fill_null(t.column("body"), ""), pre), False).to_numpy()
+        t = pf.read_row_group(
+            int(i),
+            columns=["created_et", "body"],
+        )
+
+        hit = pc.fill_null(
+            pc.match_substring_regex(
+                pc.fill_null(t.column("body"), ""),
+                pre,
+            ),
+            False,
+        ).to_numpy()
+
         if not hit.any():
             continue
+
         d = t.filter(hit).to_pandas()
-        d["target"] = map_to_target(d["created_et"], cal)
-        d = d[d["target"].notna() & (d["target"] < lb)]
-        for _, r in d.sample(frac=1.0, random_state=int(rng.integers(2**31))).iterrows():
-            found = {(a.upper() or b).replace(".", "-") for a, b in rx.findall(r["body"])} & set(syms)
-            rows += [{"symbol": s, "target": r["target"], "text": r["body"][:1500]} for s in sorted(found)]
-            if len(rows) >= want:
-                return pd.DataFrame(rows[:want])
-    return pd.DataFrame(rows)
+
+        d["target"] = map_to_target(
+            d["created_et"],
+            cal,
+        )
+
+        d = d[
+            d["target"].notna()
+            & (d["target"] < lb)
+        ]
+
+        for _, r in d.iterrows():
+            text = str(r["body"])
+
+            found = {
+                (a.upper() or b).replace(".", "-")
+                for a, b in rx.findall(text)
+            } & set(syms)
+
+            if not found:
+                continue
+
+            # Reddit semantic feature는 종목별 stance를 해석해야 하므로
+            # universe ticker가 하나만 언급된 글만 사용
+            if len(found) != 1:
+                continue
+
+            symbol = next(iter(found))
+
+            
+            # 같은 댓글 안에서 ticker가 몇 번 반복되는지
+            ticker_mentions = sum(
+            1
+            for a, b in rx.findall(text)
+            if (a.upper() or b).replace(".", "-") == symbol
+)
+
+          
+
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "target": r["target"],
+                    "created_et": r["created_et"],
+                    "text": text[:1500],
+                    "text_len": len(text),
+                    "ticker_mentions": ticker_mentions,
+                }
+)
+
+            if len(rows) >= pool_target:
+                break
+
+        if len(rows) >= pool_target:
+            break
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "target",
+                "text",
+                "sample_type",
+            ]
+        )
+
+    pool = pd.DataFrame(rows)
+
+    # 중복 제거
+    pool = pool.drop_duplicates(
+        subset=["target", "text"]
+    ).reset_index(drop=True)
+
+    # -------------------------------------------------------------------------
+    # 2. 4종 representative sample
+    #
+    # random         : 전체 후보에서 무작위
+    # long           : 긴 글
+    # ticker_repeat  : ticker 반복 언급이 많은 글
+    # recent         : 가장 최근 글
+    # -------------------------------------------------------------------------
+    n_each = max(want // 4, 1)
+
+    chosen = []
+
+    # random
+    if len(pool):
+        k = min(n_each, len(pool))
+
+        random_part = pool.iloc[
+            np.sort(
+                rng.choice(
+                    len(pool),
+                    size=k,
+                    replace=False,
+                )
+            )
+        ].copy()
+
+        random_part["sample_type"] = "random"
+        chosen.append(random_part)
+
+    # long
+    remain = pool.copy()
+
+    long_part = (
+        remain
+        .sort_values(
+            ["text_len", "created_et"],
+            ascending=[False, False],
+        )
+        .head(n_each)
+        .copy()
+    )
+
+    if len(long_part):
+        long_part["sample_type"] = "long"
+        chosen.append(long_part)
+
+    # ticker repeat
+    repeat_part = (
+        remain
+        .sort_values(
+            ["ticker_mentions", "created_et"],
+            ascending=[False, False],
+        )
+        .head(n_each)
+        .copy()
+    )
+
+    if len(repeat_part):
+        repeat_part["sample_type"] = "ticker_repeat"
+        chosen.append(repeat_part)
+
+    # recent
+    recent_part = (
+        remain
+        .sort_values(
+            "created_et",
+            ascending=False,
+        )
+        .head(n_each)
+        .copy()
+    )
+
+    if len(recent_part):
+        recent_part["sample_type"] = "recent"
+        chosen.append(recent_part)
+
+    # -------------------------------------------------------------------------
+    # 3. 합치고 중복 제거
+    # -------------------------------------------------------------------------
+    out = pd.concat(
+        chosen,
+        ignore_index=True,
+    )
+
+    out = out.drop_duplicates(
+        subset=["symbol", "target", "text"]
+    )
+
+    # 중복 제거 때문에 want보다 적어질 수 있으므로 남는 건 random으로 보충
+    if len(out) < want:
+        used = set(
+            zip(
+                out["symbol"],
+                out["target"],
+                out["text"],
+            )
+        )
+
+        rest = pool[
+            ~pool.apply(
+                lambda r: (
+                    r["symbol"],
+                    r["target"],
+                    r["text"],
+                ) in used,
+                axis=1,
+            )
+        ]
+
+        need = min(
+            want - len(out),
+            len(rest),
+        )
+
+        if need > 0:
+            extra = rest.iloc[
+                np.sort(
+                    rng.choice(
+                        len(rest),
+                        size=need,
+                        replace=False,
+                    )
+                )
+            ].copy()
+
+            extra["sample_type"] = "random_fill"
+
+            out = pd.concat(
+                [out, extra],
+                ignore_index=True,
+            )
+
+    return out[
+        [
+            "symbol",
+            "target",
+            "text",
+            "sample_type",
+        ]
+    ].head(want)
 
 
 # -----------------------------------------------------------------------------
@@ -183,24 +425,146 @@ def _key(schema, text, L):
 def call(schema, text, L, client):
     k, req = _key(schema, text, L)
     path = LLM_CACHE / f"{k}.json"
+
+    # -------------------------------------------------------------------------
+    # 1. 기존 cache가 있으면 API를 다시 호출하지 않음
+    # -------------------------------------------------------------------------
     if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))["response"], True
+        try:
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            return cached["response"], True
+        except (json.JSONDecodeError, KeyError, OSError) as e:
+            # cache 파일이 깨졌다면 API 호출을 다시 시도
+            print(f"[llm] broken cache ignored: {path.name} ({e})")
+
+    # dry_run이거나 API 호출 budget이 없는 경우
     if client is None:
         return None, False
-    resp = client.beta.messages.create(
-        model=L["model"], max_tokens=1024,
-        betas=["server-side-fallback-2026-07-01"], fallbacks="default",
-        system=SYSTEM[schema], messages=[{"role": "user", "content": text}],
-        output_config={"effort": L["effort"], "format": {"type": "json_schema", "schema": SCHEMAS[schema]}})
-    out = None
-    if resp.stop_reason != "refusal":
-        out = json.loads(next(b.text for b in resp.content if b.type == "text"))
-    meta = {"served_model": resp.model, "stop_reason": resp.stop_reason, "request_id": resp._request_id,
-            "input_tokens": resp.usage.input_tokens, "output_tokens": resp.usage.output_tokens,
-            "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+    # -------------------------------------------------------------------------
+    # 2. API 안정성 설정
+    # -------------------------------------------------------------------------
+    max_retries = int(L.get("max_retries", 3))
+    base_delay = float(L.get("retry_base_delay", 2.0))
+
+    last_error = None
+
+    # 총 시도 횟수 = 최초 1회 + retry 횟수
+    for attempt in range(max_retries + 1):
+        try:
+            # -----------------------------------------------------------------
+            # 3. LLM 호출
+            # -----------------------------------------------------------------
+            resp = client.beta.messages.create(
+                model=L["model"],
+                max_tokens=1024,
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
+                system=SYSTEM[schema],
+                messages=[{"role": "user", "content": text}],
+                output_config={
+                    "effort": L["effort"],
+                    "format": {
+                        "type": "json_schema",
+                        "schema": SCHEMAS[schema],
+                    },
+                },
+            )
+
+            # -----------------------------------------------------------------
+            # 4. 응답 parsing
+            # -----------------------------------------------------------------
+            out = None
+
+            if resp.stop_reason != "refusal":
+                text_blocks = [
+                    b.text
+                    for b in resp.content
+                    if getattr(b, "type", None) == "text"
+                ]
+
+                if not text_blocks:
+                    raise ValueError("LLM response contains no text block.")
+
+                out = json.loads(text_blocks[0])
+
+            # -----------------------------------------------------------------
+            # 5. 성공한 결과는 cache 저장
+            # -----------------------------------------------------------------
+            meta = {
+                "served_model": resp.model,
+                "stop_reason": resp.stop_reason,
+                "request_id": getattr(resp, "_request_id", None),
+                "input_tokens": resp.usage.input_tokens,
+                "output_tokens": resp.usage.output_tokens,
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "attempts": attempt + 1,
+            }
+
+            LLM_CACHE.mkdir(parents=True, exist_ok=True)
+
+            path.write_text(
+                json.dumps(
+                    {
+                        "request": req,
+                        "response": out,
+                        "meta": meta,
+                    },
+                    ensure_ascii=False,
+                    indent=1,
+                ),
+                encoding="utf-8",
+            )
+
+            return out, False
+
+        # ---------------------------------------------------------------------
+        # 6. API / network / JSON parsing 등 실패 처리
+        # ---------------------------------------------------------------------
+        except Exception as e:
+            last_error = e
+
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+
+                print(
+                    f"[llm] call failed "
+                    f"(attempt {attempt + 1}/{max_retries + 1}): "
+                    f"{type(e).__name__}: {e}"
+                )
+                print(f"[llm] retrying in {delay:.1f}s...")
+
+                time.sleep(delay)
+
+            else:
+                print(
+                    f"[llm] call permanently failed after "
+                    f"{max_retries + 1} attempts: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+    # -------------------------------------------------------------------------
+    # 7. 최종 실패 기록
+    #    실패 결과는 정상 cache로 저장하지 않음 → 나중에 재실행 가능
+    # -------------------------------------------------------------------------
     LLM_CACHE.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"request": req, "response": out, "meta": meta}, ensure_ascii=False, indent=1), encoding="utf-8")
-    return out, False
+
+    fail_path = LLM_CACHE / "failures.jsonl"
+
+    failure = {
+        "key": k,
+        "schema": schema,
+        "model": L["model"],
+        "prompt_version": PROMPT_VERSION,
+        "error_type": type(last_error).__name__ if last_error else None,
+        "error": str(last_error) if last_error else None,
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    with open(fail_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(failure, ensure_ascii=False) + "\n")
+
+    return None, False
 
 
 # -----------------------------------------------------------------------------
@@ -213,7 +577,14 @@ def _news_row(r):
 
 
 def _reddit_row(r):
-    return {"bull": {"bullish": 1.0, "bearish": -1.0}.get(r["stance"], 0.0), "hype": float(r["hype_intensity"])}
+    return {
+        "bull": {"bullish": 1.0, "bearish": -1.0}.get(r["stance"], 0.0),
+        "hype": float(r["hype_intensity"]),
+        "speculation": float(r["speculation"]),
+        "short_squeeze": float(r["short_squeeze"]),
+        "event_reaction": float(r["event_reaction"]),
+        "disagreement": float(r["disagreement"]),
+    }
 
 
 # =============================================================================
@@ -411,7 +782,16 @@ def run_llm(cfg):
     if "reddit" in L["kinds"]:
         s = sample_reddit(cfg)
         s.to_csv(out / "sample_reddit.csv", index=False)
-        jobs.append(("reddit_sentiment", "anon", s, [anonymize(t, aliases) for t in s["text"]]))
+
+        for v in L["variants"]:
+            texts = [
+                anonymize(t, aliases) if v == "anon" else t
+                for t in s["text"]
+            ]
+
+            jobs.append(
+                ("reddit_sentiment", v, s, texts)
+            )
 
     for schema, v, s, texts in jobs:
         res = []
@@ -424,7 +804,19 @@ def run_llm(cfg):
             res.append(r)
         conv = _news_row if schema == "news_event" else _reddit_row
         f = pd.DataFrame([conv(r) if r else {} for r in res], index=s.index)
-        d = pd.concat([s[["symbol", "target"]], f], axis=1).dropna(subset=f.columns.tolist() or ["symbol"])
+        if schema == "news_event":
+            d = pd.concat(
+                [s[["symbol", "target"]], f],
+                axis=1
+            ).dropna(subset=f.columns.tolist() or ["symbol"])
+
+        else:
+            d = pd.concat(
+                [s[["symbol", "target"]], f],
+                axis=1
+            ).dropna(subset=f.columns.tolist() or ["symbol"])
+
+           
         if not len(f.columns):
             continue
         if schema == "news_event":
@@ -434,9 +826,20 @@ def run_llm(cfg):
             g.columns = [f"llm_{v}_{c}" for c in g.columns]
             g.reset_index().to_parquet(C.CACHE / f"llm_features_{v}.parquet", index=False)
         else:
-            g = d.groupby(["symbol", "target"]).agg(llm_reddit_bull=("bull", "mean"), llm_reddit_hype=("hype", "mean"),
-                                                    llm_reddit_n=("bull", "size"))
-            g.reset_index().to_parquet(C.CACHE / "llm_reddit_features.parquet", index=False)
+            g = d.groupby(["symbol", "target"]).agg(
+                llm_reddit_bull=("bull", "mean"),
+                llm_reddit_hype=("hype", "mean"),
+                llm_reddit_speculation=("speculation", "mean"),
+                llm_reddit_short_squeeze=("short_squeeze", "mean"),
+                llm_reddit_event_reaction=("event_reaction", "mean"),
+                llm_reddit_disagreement=("disagreement", "mean"),
+                llm_reddit_n=("bull", "size"),
+            )
+
+            g.reset_index().to_parquet(
+                C.CACHE / f"llm_reddit_features_{v}.parquet",
+                index=False
+            )
         summary[f"{schema}/{v}"] = {"items": len(s), "parsed": int(sum(r is not None for r in res))}
 
     box = [budget]
@@ -453,6 +856,55 @@ def run_llm(cfg):
         for v in ("anon", "raw"):
             agree = np.sign(m[f"llm_{v}_sign"]) * np.sign(m["gap_pct"])
             summary[f"rest_by_agree_{v}"] = m.groupby(agree)["rest"].agg(["size", "mean"]).round(5).to_dict()
+        # -------------------------------------------------------------------------
+    # Reddit anon vs raw 비교
+    # 회사명 / ticker 제거 여부에 따라 LLM semantic 판단이 얼마나 달라지는지 확인
+    # -------------------------------------------------------------------------
+    if {"reddit_sentiment/anon", "reddit_sentiment/raw"} <= set(summary):
+        a = pd.read_parquet(
+            C.CACHE / "llm_reddit_features_anon.parquet"
+        )
+        b = pd.read_parquet(
+            C.CACHE / "llm_reddit_features_raw.parquet"
+        )
+
+        m = a.merge(
+            b,
+            on=["symbol", "target"],
+            suffixes=("_anon", "_raw"),
+        )
+
+        summary["reddit_anon_raw_pairs"] = int(len(m))
+
+        # bullish / bearish stance 기반 feature 일치 정도
+        summary["reddit_bull_agreement_anon_raw"] = float(
+            np.isclose(
+                m["llm_reddit_bull_anon"],
+                m["llm_reddit_bull_raw"],
+            ).mean()
+        )
+
+        # hype는 연속 평균값이므로 평균 절대 차이로 비교
+        summary["reddit_hype_mae_anon_raw"] = float(
+            (
+                m["llm_reddit_hype_anon"]
+                - m["llm_reddit_hype_raw"]
+            ).abs().mean()
+        )
+
+        # boolean semantic feature들은 일치율 확인
+        for c in [
+            "speculation",
+            "short_squeeze",
+            "event_reaction",
+            "disagreement",
+        ]:
+            summary[f"reddit_{c}_agreement_anon_raw"] = float(
+                np.isclose(
+                    m[f"llm_reddit_{c}_anon"],
+                    m[f"llm_reddit_{c}_raw"],
+                ).mean()
+            )
     with open(out / "pending.jsonl", "w", encoding="utf-8") as fh:
         for p in pending:
             fh.write(json.dumps(p, ensure_ascii=False) + "\n")
@@ -462,3 +914,4 @@ def run_llm(cfg):
     print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
     print(f"[llm] → {out}  (dry_run 이면 pending.jsonl 에 보낼 입력 {len(pending)}건)")
     return out
+
