@@ -1,0 +1,63 @@
+# M3 — 개장 직전 뉴스 (리서치 3순위)
+# 질문: 창 전체(기준일 09:30 ~ 대상일 09:30)가 아니라 개장 직전에 들어온 뉴스만 따로 세면 크기 판단이 나아지는가?
+#   ovn  = [기준일 16:00, 대상일 09:30)   (장 마감 후 ~ 개장 전)
+#   late = [대상일 06:30, 09:30)          (개장 3시간 전, JFR 2024 "Tweets versus broadsheets" 의 3h 창)
+# 구조: 갭 + k 위에 크기 배율만 바꿈 (T2·M2 와 같은 구조)
+#   R: textclf(columns) — P(급등락 | 뉴스 수) 로지스틱 → 삼분위 배율
+#   H: magmodel excess — M2 의 H4 에 개장 전 뉴스 수를 더함
+# DEV 탐색: 개장 전 톤의 방향 정보 없음 (partial ρ −0.006), 크기 정보는 창 전체 count 와 비슷 (0.078 vs 0.081)
+# lockbox 사용 후 실험이라 Holm 보정, seed 는 M1·M2 와 같음
+# 실행: uv run python -m exp run configs/m3_recent_news.toml
+
+name = "m3_recent_news"
+stage = "M3"
+seed = 20261011
+
+[data]
+groups = ["core", "event", "premkt", "har", "txt_count", "txt_recent"]
+
+[eval]
+baseline = "B2"
+multiplicity = "holm"
+family_size = 6
+
+[[candidates]]
+name = "B2"
+signal = { type = "gap" }
+decision = { type = "k" }
+
+[[candidates]]
+name = "R0-count"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "columns", columns = ["txt_count"] } }
+
+[[candidates]]
+name = "R1-recent"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "columns", columns = ["txt_recent"] } }
+
+[[candidates]]
+name = "R2-count+recent"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "columns", columns = ["txt_count", "txt_recent"] } }
+
+[[candidates]]
+name = "R3-late-tercile"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "tercile", params = { var = "n_first_r1_ovn" } }
+
+[[candidates]]
+name = "H4-har+pre-excess"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "magmodel", params = { columns = ["har", "pre_rng", "earn"], mode = "excess" } }
+
+[[candidates]]
+name = "H5-har+pre+news-excess"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "magmodel", params = { columns = ["har", "pre_rng", "earn", "n_first_r1_ovn", "n_clu_r1_late"], mode = "excess" } }

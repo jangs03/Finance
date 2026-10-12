@@ -1,0 +1,56 @@
+# M5 — 실적일 보정 (진단 노트북 05 결론 1)
+# 질문: 데이터 안에서 갭 외에 방향 정보가 있는 유일한 곳(실적 서프라이즈)을 쓰면 score 가 오르는가?
+#   S: 방향 보정 — s = gap + β·f(서프라이즈),  β = fit 구간 실적일 행의 OLS (rest ~ f)
+#   K: 크기 보정 — 실적일에만 갭 배율을 따로 둠 (tercile regime 에 이진 변수 earn: f_low = 평소, f_high = 실적일)
+#      실적일은 64% 가 급등락이고 갭 방향 적중률이 79~84% 라, 크기 정보가 점수로 바뀔 수 있는 드문 경우
+# DEV 탐색: 실적일 358행(1.6%), 서프라이즈의 85% 가 상회. 하회 39행의 rest 가 기간마다 부호가 바뀜 (−0.93 → +0.21)
+#   → 방향 보정의 기대 효과는 작음. 평가 fold 당 실적일 약 70행이라 검정력도 낮음
+# lockbox 사용 후 실험이라 Holm 보정, seed 는 M1~M4 와 같음
+# 2026-10-12 추가: B2-split 대조군 (S 와 같은 k 선택 구간). S1 − B2-split 이 β 의 순효과
+# 실행: uv run python -m exp run configs/m5_earnings.toml
+
+name = "m5_earnings"
+stage = "M5"
+seed = 20261011
+
+[data]
+groups = ["core", "event"]
+
+[eval]
+baseline = "B2"
+multiplicity = "holm"
+family_size = 5
+
+[[candidates]]
+name = "B2"
+signal = { type = "gap" }
+decision = { type = "k" }
+
+# 대조군: S 계열은 학습형 신호라 k 를 학습 구간 마지막 20% 로만 고름. 같은 조건의 B2 를 둬서 β 효과만 분리
+[[candidates]]
+name = "B2-split"
+signal = { type = "gap" }
+decision = { type = "k" }
+tune_on = "split"
+
+[[candidates]]
+name = "S1-surp-sign"
+signal = { type = "earn_surp", params = { mode = "sign" } }
+decision = { type = "k" }
+
+[[candidates]]
+name = "S2-surp-pct"
+signal = { type = "earn_surp", params = { mode = "pct", clip = 20.0 } }
+decision = { type = "k" }
+
+[[candidates]]
+name = "K1-earn-boost"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "tercile", params = { var = "earn", f_grid = [0.6, 3.01, 0.1] } }
+
+[[candidates]]
+name = "S1+K1"
+signal = { type = "earn_surp", params = { mode = "sign" } }
+decision = { type = "k" }
+regime = { type = "tercile", params = { var = "earn", f_grid = [0.6, 3.01, 0.1] } }

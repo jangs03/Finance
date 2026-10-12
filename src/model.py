@@ -45,6 +45,7 @@ MIN_LOO = 3              # 시장 갭을 계산할 최소 다른 종목 수
 BIG_GAP = 1.0            # regime: 큰 갭 종목 기준(%)
 RET_CLIP = 15.0          # 회귀 목표 절단(%)
 DEFAULT_K = 5.25         # artifact 가 없을 때만 쓰는 갭 규칙 배율. EDA 값이라 lockbox 가 노출된 값임 (실험·제출은 학습으로 k 를 고름)
+SEQ_LEN = 20             # 시계열 feature(seq) 길이: 기준일 포함 직전 20 거래일
 CLASS_CENTERS = np.array([-4.0, -1.5, 0.0, 1.5, 4.0])   # 5-class 확률 → 기대 수익률(%) 신호
 
 ARTIFACT = ARTIFACTS / "pipeline.pkl"
@@ -59,11 +60,17 @@ FEATURE_GROUPS = {
     "analyst": ["an_n", "an_up", "an_down", "an_tgt_chg", "an_gap_agree"],
     "news":    ["news_n", "news_abn", "tone_mean", "tone_min", "tone_max", "tone_neg_tail", "news_missing"],
     "regime":  ["reg_med_vol20", "reg_med_absgap", "reg_gap_disp", "reg_mkt_gap", "reg_big_ratio"],
+    # 시계열: ret_l{i} = (i−1) 거래일 전 일간 수익률(%), rng_l{i} = 같은 날 (고가−저가)/종가(%). l1 = 기준일
+    "seq":     [f"ret_l{i}" for i in range(1, SEQ_LEN + 1)] + [f"rng_l{i}" for i in range(1, SEQ_LEN + 1)],
+    # 프리마켓 경로: 대상일 pre 봉(known_at < 09:30) 종가의 범위, 갭을 시간외(post)·프리마켓(pre) 두 구간으로 분해
+    "premkt":  ["pre_rng", "post_ret", "pre_ret"],
+    # HAR 식 크기 변수: |갭|, 과거 |수익률| 의 1·5·22일 평균 (Corsi 2009 의 일·주·월 성분)
+    "har":     ["abs_gap", "absr1", "absr5", "absr22"],
 }
 # 묶음마다 필요한 원천 표. day_tables() 가 필요한 표만 읽게 함
 GROUP_TABLES = {
     "core": {"daily", "price"}, "scale": {"daily", "price"}, "cross": {"daily", "price"},
-    "regime": {"daily", "price"}, "event": {"earnings"}, "analyst": {"analyst"}, "news": {"news"},
+    "regime": {"daily", "price"}, "seq": {"daily", "price"}, "premkt": {"daily", "price"}, "har": {"daily", "price"}, "event": {"earnings"}, "analyst": {"analyst"}, "news": {"news"},
 }
 DEPLOYABLE = {c for cols in FEATURE_GROUPS.values() for c in cols}
 KEY_COLS = ["symbol", "date", "target"]
@@ -148,8 +155,10 @@ def map_to_target(ts, targets):
 #         atr14   = mean(TR, 14일),  TR = max(H−L, |H−C₋₁|, |L−C₋₁|) / C × 100
 #         big_rate60 = mean(1[ret_pct < −2.5 or ≥ 2.5], 60일)
 #         beta60  = 0.5 × cov(r, m)/var(m) (60일) + 0.5,  m = 자기 제외 중앙 수익률
+#         ret_l{i} = ret_pct(기준일 − (i−1) 거래일),  rng_l{i} = (H−L)/C × 100 (같은 날),  i = 1..SEQ_LEN
+#         absr1 = |ret_pct| (기준일),  absr5 / absr22 = mean(|ret_pct|, 최근 5 / 22일)
 # input : daily  일봉 (symbol, date_et, high, low, close, prev_close, ret)
-# output: DataFrame[symbol, date, close_d0, vol5, vol20, atr14, big_rate60, beta60]
+# output: DataFrame[symbol, date, close_d0, vol5, vol20, atr14, big_rate60, beta60, ret_l*, rng_l*, absr*]
 # -----------------------------------------------------------------------------
 def _daily_block(daily):
     d = daily.assign(date=daily["date_et"].astype(NS).dt.normalize())
@@ -166,11 +175,16 @@ def _daily_block(daily):
     m = loo_median(r, d["date"])
     ex, em, exm, emm = roll(r, 60, "mean"), roll(m, 60, "mean"), roll(r * m, 60, "mean"), roll(m * m, 60, "mean")
     beta = (exm - ex * em) / (emm - em ** 2)
+    rng = (d["high"] - d["low"]) / d["close"] * 100
+    seq = {f"{name}_l{i}": v.groupby(sym).shift(i - 1)
+           for name, v in (("ret", r), ("rng", rng)) for i in range(1, SEQ_LEN + 1)}
     return pd.DataFrame({
         "symbol": sym, "date": d["date"], "close_d0": d["close"],
         "vol5": roll(r, 5, "std"), "vol20": roll(r, 20, "std"), "atr14": roll(tr, 14, "mean"),
         "big_rate60": roll(big, 60, "mean"),
         "beta60": (BETA_SHRINK * beta + (1 - BETA_SHRINK)).fillna(1.0),
+        "absr1": r.abs(), "absr5": roll(r.abs(), 5, "mean"), "absr22": roll(r.abs(), 22, "mean"),
+        **seq,
     })
 
 
@@ -188,6 +202,20 @@ def _extended_hours(price):
     post = p["session"] == "post"
     last = lambda m: p[m].groupby([p.loc[m, "symbol"], day[m]])["close"].last()
     return last(pre), last(post)
+
+
+# -----------------------------------------------------------------------------
+# 기능  : 대상일 프리마켓 경로의 범위 (_extended_hours 와 같은 봉: pre, known_at < 그날 09:30)
+# 수식  : pre_rng = (max close / min close − 1) × 100   (봉 1개뿐이면 0)
+# input : price  시간봉
+# output: Series index = (symbol, day)
+# -----------------------------------------------------------------------------
+def _premarket_range(price):
+    p = price[price["session"] == "pre"]
+    day = p["datetime"].astype(NS).dt.normalize()
+    p = p[p["known_at"].astype(NS) < day + CUTOFF]
+    g = p.groupby([p["symbol"], day[p.index]])["close"]
+    return (g.max() / g.min() - 1) * 100
 
 
 # -----------------------------------------------------------------------------
@@ -292,10 +320,18 @@ FEATURE_GROUPS.update({
     "txt_event": [f"ev_{e}_r1" for e in EVENT_RX] + ["ev_any_r1"],
     "txt_meta": ["n_scored_r1", "tmpl_share_r0", "alias_missing"],
     "txt_text": ["titles_r1"],
+    # 개장 직전 뉴스 (리서치 3순위): ovn = [기준일 16:00, 대상일 09:30),  late = [대상일 06:30, 09:30)
+    # 뉴스 본문 (리서치 4순위): R1 대표 기사의 본문 첫 BODY_CHARS 글자(lead). 본문은 기사의 약 7.5% 에만 있음
+    "txt_body": ["n_body_r1", "body_share_r1", "body_mention_r1", "ev_any_body_r1"],
+    "txt_lead": ["lead_r1", "doc_r1"],
+    "txt_recent": ["n_clu_r1_ovn", "n_first_r1_ovn", "n_first_r1_ovn_abn", "n_clu_r1_late", "n_first_r1_late",
+                   "ovn_share_r1", "tone_mean_r1_ovn"],
 })
-for _g in ("txt_count", "txt_tone_gdelt", "txt_tone_lm", "txt_novelty", "txt_event", "txt_meta", "txt_text"):
+for _g in ("txt_count", "txt_tone_gdelt", "txt_tone_lm", "txt_novelty", "txt_event", "txt_meta", "txt_text",
+           "txt_recent", "txt_body", "txt_lead"):
     GROUP_TABLES[_g] = {"news"}
-TEXT_COLS = {"titles_r1"}                      # 문자열 열 (숫자 비교·결측 채우기에서 제외)
+TEXT_COLS = {"titles_r1", "lead_r1", "doc_r1"}  # 문자열 열 (숫자 비교·결측 채우기에서 제외)
+BODY_CHARS = 600                                 # 본문은 첫 600 글자(lead)만 씀 (기사 앞부분에 핵심, 메모리 절약)
 DEPLOYABLE = {c for cols in FEATURE_GROUPS.values() for c in cols}
 
 
@@ -394,7 +430,7 @@ def lm_scores(titles, lm):
 #         rel: 0 태그만, 1 제목에 그 회사 언급, 2 언급된 회사가 그 회사 하나뿐
 # -----------------------------------------------------------------------------
 ARTICLE_COLS = ["symbol", "target", "widx", "known_at", "source", "title", "tone", "title_id", "ckey",
-                "is_template", "rel", "n_entities"]
+                "is_template", "rel", "n_entities", "lead"]
 
 
 def text_articles(news, targets, universe, res=None):
@@ -408,6 +444,8 @@ def text_articles(news, targets, universe, res=None):
     n = n.reset_index(drop=True)
     if "source" not in n.columns:
         n["source"] = ""
+    lead = n["text"] if "text" in n.columns else pd.Series("", index=n.index)
+    n["lead"] = lead.fillna("").astype(str).str.slice(0, BODY_CHARS).str.replace(r"\s+", " ", regex=True).str.strip()
     n["title"] = clean_title(n["title"])
     norm = n["title"].str.lower().str.replace(r"[^a-z0-9]+", " ", regex=True).str.strip()
     n["title_id"] = pd.util.hash_pandas_object(norm, index=False).astype(str).to_numpy()
@@ -463,6 +501,12 @@ def _novelty(reps):
 #           tone_mean / tone_neg_share(tone<0 비율) / tone_sd(2개 이상)   ← GDELT tone, 규칙 2개 + 분산
 #           lm_net / lm_neg_share(lm_net<0 비율) / lm_unc                  ← LM 금융 사전
 #           novelty, ev_*(사건 유형 포함 여부), n_scored(대표 기사 수), titles_r1(대표 제목 " || " 연결)
+#         txt_body: n_body_r1 = 본문이 있는 R1 클러스터 수,  body_share_r1 = n_body_r1 / n_clu_r1
+#           body_mention_r1 = 본문 lead 안 그 회사 언급 횟수 평균 (본문 있는 대표 기사만),  ev_any_body_r1 = lead 에 사건 정규식
+#           lead_r1 = 대표 기사 lead " || " 연결,  doc_r1 = titles_r1 + " || " + lead_r1  (문자열 열)
+#         txt_recent: 대표 기사(클러스터 첫 기사) 시각이 ovn = [기준일 16:00, 대상일 09:30) / late = [대상일 06:30, 09:30)
+#           n_clu_r1_{ovn,late}, n_first_r1_{ovn,late}, n_first_r1_ovn_abn, ovn_share_r1 = n_clu_r1_ovn / n_clu_r1,
+#           tone_mean_r1_ovn (ovn 대표 기사 tone 평균)
 #         기사가 없으면 count 는 0, 톤·신규성·사건은 NaN (문서 없음 ≠ 중립, w5-1 p19)
 # -----------------------------------------------------------------------------
 def _text_block(news, targets, universe):
@@ -497,7 +541,8 @@ def _text_block(news, targets, universe):
     out["n_src_r1"] = r1.groupby(["symbol", "widx"])["source"].nunique().reindex(grid).fillna(0.0)
 
     reps = r1.groupby(["symbol", "widx", "ckey"], sort=False).agg(
-        title=("title", "first"), known_at=("known_at", "first"), tone=("tone", "mean")).reset_index()
+        title=("title", "first"), known_at=("known_at", "first"), tone=("tone", "mean"),
+        lead=("lead", "max")).reset_index()                    # max = 클러스터 안 비어 있지 않은 lead 하나 (문자열 순 최대)
     reps = reps.sort_values(["symbol", "widx", "known_at", "ckey"], kind="stable").reset_index(drop=True)
     reps = pd.concat([reps, lm_scores(reps["title"], res.get("lm"))], axis=1)
     low = reps["title"].str.lower()
@@ -518,6 +563,42 @@ def _text_block(news, targets, universe):
     agg.index.names = ["symbol", "widx"]
     out = out.join(agg)
     out["novelty_r1"] = _novelty(reps).reindex(grid)
+
+    # 본문 lead
+    has = reps["lead"].str.len().to_numpy() > 0
+    ment = np.full(len(reps), np.nan)
+    evb = np.full(len(reps), np.nan)
+    for s, idx in reps.groupby("symbol").indices.items():
+        idx = idx[has[idx]]
+        if len(idx):
+            ld = reps["lead"].iloc[idx]
+            ment[idx] = ld.str.count(symbol_pattern(s, res.get("aliases", {}))).to_numpy(float)
+            low_l = ld.str.lower()
+            evb[idx] = np.max([low_l.str.contains(rx, regex=True).to_numpy(float) for rx in EVENT_RX.values()], axis=0)
+    hb = reps[has]
+    kb = [hb["symbol"], hb["widx"]]
+    out["n_body_r1"] = hb.groupby(kb).size().reindex(grid).fillna(0.0)
+    out["body_share_r1"] = out["n_body_r1"] / out["n_clu_r1"].where(out["n_clu_r1"] > 0)
+    out["body_mention_r1"] = pd.Series(ment[has], index=hb.index).groupby(kb).mean().reindex(grid)
+    out["ev_any_body_r1"] = pd.Series(evb[has], index=hb.index).groupby(kb).max().reindex(grid)
+    out["lead_r1"] = hb.groupby(kb)["lead"].agg(" || ".join).reindex(grid)
+
+    # 개장 직전 뉴스: 대표 기사 시각으로 창 안의 하위 구간을 나눔
+    base_day = pd.Series(targets["date"].astype(NS).to_numpy(), index=targets["target"].astype(NS).to_numpy())
+    base_day = base_day[~base_day.index.duplicated()]
+    t_of = tgt[reps["widx"].to_numpy()] if len(reps) else np.array([], dtype=NS)
+    ka = reps["known_at"].astype(NS).to_numpy()
+    ovn = ka >= base_day.reindex(t_of).to_numpy(NS) + np.timedelta64(16, "h")
+    late = ka >= t_of + np.timedelta64(390, "m")
+    first = clus.set_index(["symbol", "widx", "ckey"])["is_first"]
+    is_first = first.reindex(pd.MultiIndex.from_arrays([reps["symbol"], reps["widx"], reps["ckey"]])).fillna(False).to_numpy(bool)
+    for name, m in (("ovn", ovn), ("late", late)):
+        out[f"n_clu_r1_{name}"] = reps[m].groupby([reps["symbol"][m], reps["widx"][m]]).size().reindex(grid).fillna(0.0)
+        out[f"n_first_r1_{name}"] = reps[m & is_first].groupby([reps["symbol"][m & is_first], reps["widx"][m & is_first]]).size().reindex(grid).fillna(0.0)
+    b = out.groupby(level="symbol")["n_first_r1_ovn"].transform(lambda v: v.shift().rolling(NEWS_WINDOW, min_periods=NEWS_WINDOW).mean())
+    out["n_first_r1_ovn_abn"] = np.log1p(out["n_first_r1_ovn"]) - np.log1p(b)
+    out["ovn_share_r1"] = out["n_clu_r1_ovn"] / out["n_clu_r1"].where(out["n_clu_r1"] > 0)
+    out["tone_mean_r1_ovn"] = reps[ovn].groupby([reps["symbol"][ovn], reps["widx"][ovn]])["tone"].mean().reindex(grid)
     out["n_scored_r1"] = out["n_scored_r1"].fillna(0.0)
     out["ev_any_r1"] = out[[f"ev_{e}_r1" for e in EVENT_RX]].max(axis=1)
     out["alias_missing"] = (~out.index.get_level_values("symbol").isin(list(res.get("aliases", {})))).astype(float)
@@ -555,6 +636,12 @@ def build_features(tables, targets, universe):
     x["gap_fallback"] = (pre_v.isna() & post_v.notna()).astype(float)
     x["gap_missing"] = px.isna().astype(float)
     x["gap_pct"] = (px / x["close_d0"] - 1) * 100
+    # 프리마켓 경로 (premkt): post_ret + pre_ret ≈ gap_pct (post 봉이 없으면 post_ret = NaN, pre_ret = gap)
+    rng = _premarket_range(tables["price"][tables["price"]["symbol"].isin(uni)])
+    x["pre_rng"] = rng.reindex(pd.MultiIndex.from_arrays([x["symbol"], x["target"]])).to_numpy()
+    x["post_ret"] = (post_v / x["close_d0"] - 1) * 100
+    x["pre_ret"] = (pre_v / post_v.fillna(x["close_d0"]) - 1) * 100
+    x["abs_gap"] = x["gap_pct"].abs()
 
     x["gap_rank"] = x.groupby("target")["gap_pct"].rank(pct=True)
     x["zgap"] = (x["gap_pct"] / x["vol20"].clip(lower=VOL_FLOOR)).clip(-ZGAP_CLIP, ZGAP_CLIP)
@@ -578,7 +665,9 @@ def build_features(tables, targets, universe):
         x = x.merge(_text_block(tables["news"], targets, universe), on=key, how="left")
     for c in DEPLOYABLE - set(x.columns):
         x[c] = "" if c in TEXT_COLS else np.nan
-    x["titles_r1"] = x["titles_r1"].fillna("")
+    for c in TEXT_COLS - {"doc_r1"}:
+        x[c] = x[c].fillna("")
+    x["doc_r1"] = (x["titles_r1"] + " || " + x["lead_r1"]).where(x["lead_r1"].str.len() > 0, x["titles_r1"])
     for c in ("earn", "an_n", "an_up", "an_down"):
         x[c] = x[c].fillna(0.0)
     x["an_gap_agree"] = (np.sign(x["an_up"] - x["an_down"]) * np.sign(x["gap_pct"])).fillna(0.0)
@@ -595,6 +684,7 @@ def build_features(tables, targets, universe):
 # -----------------------------------------------------------------------------
 def day_tables(day, groups):
     need = set().union(*(GROUP_TABLES[g] for g in groups)) | {"daily", "price"}
+    need_body = bool({"txt_body", "txt_lead"} & set(groups))       # 본문은 무거워 필요할 때만 읽음
     t = {"daily": day.daily(days=HIST_DAYS, columns=["symbol", "date_et", "high", "low", "close", "prev_close", "ret"]),
          "price": day.price(since=day.date, columns=["symbol", "datetime", "close", "session"])}
     since = day.date + CUTOFF
@@ -603,7 +693,8 @@ def day_tables(day, groups):
     if "analyst" in need:
         t["analyst"] = day.analyst(since=since)
     if "news" in need:
-        t["news"] = day.news(days=NEWS_HIST_DAYS, columns=["symbols", "source", "title", "tone"])
+        cols = ["symbols", "source", "title", "tone"] + (["text"] if need_body else [])
+        t["news"] = day.news(days=NEWS_HIST_DAYS, columns=cols)
     dates = sorted(pd.to_datetime(t["daily"]["date_et"]).dt.normalize().unique())
     dates = [d for d in dates if d <= day.date]
     targets = pd.DataFrame({"date": dates, "target": dates[1:] + [day.target]})
@@ -835,8 +926,249 @@ class DecompSignal:
         return self
 
 
+def _xgb_params(params, seed):
+    p = dict(n_estimators=300, max_depth=4, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
+             min_child_weight=20, reg_lambda=1.0, tree_method="hist", n_jobs=4, random_state=seed)
+    p.update(params or {})
+    return p
+
+
+# -----------------------------------------------------------------------------
+# 기능  : XGBoost 회귀 신호 (M1). RegressSignal 의 HGB 를 XGBoost 로 바꾼 것
+# input : X[features] (NaN 은 XGBoost 가 결측 방향을 학습),  목표 y = clip(ret_pct, ±15)
+# loss  : reg:absoluteerror  L = |y − ŷ|  (중앙값 회귀)
+# output: s = ŷ (%)
+# -----------------------------------------------------------------------------
+class XGBRegSignal(RegressSignal):
+    def fit(self, X, y_ret, y_label, seed=0):
+        from xgboost import XGBRegressor
+        self.model = XGBRegressor(objective="reg:absoluteerror", **_xgb_params(self.params, seed))
+        self.model.fit(X[self.features], np.clip(y_ret, -RET_CLIP, RET_CLIP))
+        return self
+
+
+# -----------------------------------------------------------------------------
+# 기능  : XGBoost 5-class 분류 신호 (M1). Classify5Signal 의 HGB 를 XGBoost 로 바꾼 것
+# input : X[features],  목표 label 0~4 (학습 구간에 없는 class 는 확률 0)
+# loss  : multi:softprob  L = −log P(y)
+# output: s = Σ_c P(c) · center_c
+# -----------------------------------------------------------------------------
+class XGBCls5Signal(Classify5Signal):
+    def fit(self, X, y_ret, y_label, seed=0):
+        from xgboost import XGBClassifier
+        y = np.asarray(y_label, int)
+        self.classes = np.unique(y)
+        self.model = XGBClassifier(objective="multi:softprob", **_xgb_params(self.params, seed))
+        self.model.fit(X[self.features], np.searchsorted(self.classes, y))
+        return self
+
+    def proba(self, X):
+        P = np.zeros((len(X), 5))
+        P[:, self.classes] = self.model.predict_proba(X[self.features])
+        return P
+
+    def state(self):
+        return {"model": self.model, "classes": self.classes}
+
+    def load(self, st):
+        self.model, self.classes = st["model"], np.asarray(st["classes"], int)
+        return self
+
+
+# -----------------------------------------------------------------------------
+# 기능  : LSTM 회귀 신호 (M1). 직전 SEQ_LEN 거래일의 (수익률, 일중 범위) 시퀀스 + 정적 feature
+# input : 시퀀스 x_t = [ret_l{L+1−t}, rng_l{L+1−t}],  t = 1..L (과거 → 기준일 순서)
+#         정적 z = features 중 seq 가 아닌 열 (예: gap_pct, gap_rank)
+#         표준화 (x − μ)/σ 는 fit 구간 값으로 계산해 저장, 결측은 표준화 뒤 0
+# 구조  : h_L = LSTM(x_1..x_L)  (hidden H)
+#         ŷ   = W2 · ReLU(W1 · [h_L, z] + b1) + b2
+# loss  : Huber(δ = 1) on y = clip(ret_pct, ±15)
+# 학습  : Adam(lr, weight_decay), 고정 epoch, 배치 섞기는 seed 고정 generator
+#         torch 는 학습에만 쓰고 predict 는 저장한 가중치로 numpy 순전파 (채점 환경에 torch 가 없어도 동작)
+# output: s = ŷ (%)
+# -----------------------------------------------------------------------------
+class LSTMSignal:
+    learnable = True
+    kind = "scalar"
+    DEFAULTS = dict(hidden=32, dense=32, epochs=15, batch=512, lr=1e-3, weight_decay=1e-4, huber=1.0, threads=4)
+
+    def __init__(self, features, params=None):
+        self.features = list(features)
+        self.params = {**self.DEFAULTS, **(params or {})}
+        seq = set(FEATURE_GROUPS["seq"])
+        self.static = [c for c in self.features if c not in seq]
+        self.use_seq = seq <= set(self.features)
+        self.w = None
+
+    def _arrays(self, X):
+        n = len(X)
+        if self.use_seq:
+            idx = range(SEQ_LEN, 0, -1)                 # 과거 → 기준일
+            S = np.stack([X[[f"ret_l{i}" for i in idx]].to_numpy(float),
+                          X[[f"rng_l{i}" for i in idx]].to_numpy(float)], axis=2)
+        else:
+            S = np.zeros((n, 1, 2))
+        Z = X[self.static].to_numpy(float) if self.static else np.zeros((n, 0))
+        return S, Z
+
+    def _norm(self, S, Z):
+        return np.nan_to_num((S - self.mu_s) / self.sd_s), np.nan_to_num((Z - self.mu_z) / self.sd_z)
+
+    def fit(self, X, y_ret, y_label, seed=0):
+        import torch
+        from torch import nn
+        P = self.params
+        S, Z = self._arrays(X)
+        self.mu_s, self.sd_s = np.nanmean(S, axis=(0, 1)), np.nanstd(S, axis=(0, 1)) + 1e-6
+        self.mu_z, self.sd_z = np.nanmean(Z, axis=0), np.nanstd(Z, axis=0) + 1e-6
+        S, Z = self._norm(S, Z)
+        y = np.clip(np.asarray(y_ret, float), -RET_CLIP, RET_CLIP)
+
+        torch.manual_seed(seed)
+        torch.set_num_threads(int(P["threads"]))
+        torch.use_deterministic_algorithms(True)
+        H, D = int(P["hidden"]), int(P["dense"])
+        rnn = self._cell(nn, H)
+        head = nn.Sequential(nn.Linear(H + Z.shape[1], D), nn.ReLU(), nn.Linear(D, 1))
+        opt = torch.optim.Adam(list(rnn.parameters()) + list(head.parameters()),
+                               lr=float(P["lr"]), weight_decay=float(P["weight_decay"]))
+        loss_fn = nn.HuberLoss(delta=float(P["huber"]))
+        tS, tZ, ty = (torch.tensor(a, dtype=torch.float32) for a in (S, Z, y))
+        g = torch.Generator().manual_seed(seed)
+        B = int(P["batch"])
+        for _ in range(int(P["epochs"])):
+            perm = torch.randperm(len(ty), generator=g)
+            for i in range(0, len(ty), B):
+                j = perm[i:i + B]
+                _, h = rnn(tS[j])
+                h = h[0] if isinstance(h, tuple) else h        # LSTM 은 (h, c), GRU 는 h
+                loss = loss_fn(head(torch.cat([h[-1], tZ[j]], dim=1)).squeeze(1), ty[j])
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        sd = {k: v.detach().numpy().copy() for k, v in rnn.state_dict().items()}
+        hd = {k: v.detach().numpy().copy() for k, v in head.state_dict().items()}
+        self.w = {**self._cell_weights(sd),
+                  "W1": hd["0.weight"], "b1": hd["0.bias"], "W2": hd["2.weight"], "b2": hd["2.bias"]}
+        return self
+
+    def _cell(self, nn, H):
+        return nn.LSTM(2, H, batch_first=True)
+
+    def _cell_weights(self, sd):
+        return {"W_ih": sd["weight_ih_l0"], "W_hh": sd["weight_hh_l0"], "b": sd["bias_ih_l0"] + sd["bias_hh_l0"]}
+
+    # -------------------------------------------------------------------------
+    # 기능  : numpy LSTM 순전파 (torch nn.LSTM 과 같은 식, 게이트 순서 i, f, g, o)
+    # 수식  : i,f,o = σ(W_ih x_t + W_hh h_{t−1} + b),  g = tanh(·)
+    #         c_t = f⊙c_{t−1} + i⊙g,  h_t = o⊙tanh(c_t)
+    # output: h_L  (n, H)
+    # -------------------------------------------------------------------------
+    def _encode(self, S):
+        w = self.w
+        H = w["W_hh"].shape[1]
+        h, c = np.zeros((len(S), H)), np.zeros((len(S), H))
+        for t in range(S.shape[1]):
+            a = S[:, t] @ w["W_ih"].T + h @ w["W_hh"].T + w["b"]
+            i, f, g, o = _sigmoid(a[:, :H]), _sigmoid(a[:, H:2 * H]), np.tanh(a[:, 2 * H:3 * H]), _sigmoid(a[:, 3 * H:])
+            c = f * c + i * g
+            h = o * np.tanh(c)
+        return h
+
+    def predict(self, X):
+        S, Z = self._norm(*self._arrays(X))
+        w = self.w
+        z = np.maximum(np.concatenate([self._encode(S), Z], axis=1) @ w["W1"].T + w["b1"], 0)
+        return (z @ w["W2"].T + w["b2"])[:, 0]
+
+    def state(self):
+        return {"w": self.w, "mu_s": self.mu_s, "sd_s": self.sd_s, "mu_z": self.mu_z, "sd_z": self.sd_z}
+
+    def load(self, st):
+        self.w, self.mu_s, self.sd_s, self.mu_z, self.sd_z = (st[k] for k in ("w", "mu_s", "sd_s", "mu_z", "sd_z"))
+        return self
+
+
+def _sigmoid(a):
+    return 1 / (1 + np.exp(-a))
+
+
+# -----------------------------------------------------------------------------
+# 기능  : GRU 회귀 신호 (M1). LSTMSignal 과 입력·head·loss·학습이 같고 순환 셀만 GRU
+#         (게이트 2개 + cell state 없음 → 파라미터 약 3/4, 짧은 시퀀스·작은 표본에서 덜 과적합)
+# 수식  : r = σ(W_ir x_t + b_ir + W_hr h_{t−1} + b_hr),  u = σ(W_iz x_t + b_iz + W_hz h_{t−1} + b_hz)
+#         n = tanh(W_in x_t + b_in + r⊙(W_hn h_{t−1} + b_hn)),  h_t = (1−u)⊙n + u⊙h_{t−1}
+# output: s = ŷ (%)
+# -----------------------------------------------------------------------------
+class GRUSignal(LSTMSignal):
+    def _cell(self, nn, H):
+        return nn.GRU(2, H, batch_first=True)
+
+    def _cell_weights(self, sd):
+        return {"W_ih": sd["weight_ih_l0"], "W_hh": sd["weight_hh_l0"], "b_ih": sd["bias_ih_l0"], "b_hh": sd["bias_hh_l0"]}
+
+    def _encode(self, S):
+        w = self.w
+        H = w["W_hh"].shape[1]
+        h = np.zeros((len(S), H))
+        for t in range(S.shape[1]):
+            gi = S[:, t] @ w["W_ih"].T + w["b_ih"]
+            gh = h @ w["W_hh"].T + w["b_hh"]
+            r, u = _sigmoid(gi[:, :H] + gh[:, :H]), _sigmoid(gi[:, H:2 * H] + gh[:, H:2 * H])
+            n = np.tanh(gi[:, 2 * H:] + r * gh[:, 2 * H:])
+            h = (1 - u) * n + u * h
+        return h
+
+
+# -----------------------------------------------------------------------------
+# 기능  : 실적일 서프라이즈 방향 보정 신호 (M5). 갭에 "실적 발표 후 같은 방향으로 더 가는 몫(PEAD)" 을 더함
+# 수식  : f = surp_sign (mode="sign")  또는  clip(surp_pct_w, ±c)/c (mode="pct"),  실적일이 아니면 f = 0
+#         β  = OLS 기울기:  rest = ret_pct − gap_pct  ~  a + β·f    (fit 구간의 실적일 행만)
+#         s  = gap_pct + β·f                                         (실적일 아닌 행은 gap 그대로)
+# loss  : 제곱오차 (β 추정),  k 는 tune 구간 score 최대 (결정 규칙)
+# input : X[gap_pct, earn, surp_sign, surp_pct_w],  params {mode, clip, shrink (β 에 곱하는 수축, 기본 1)}
+# output: s (%)
+# -----------------------------------------------------------------------------
+class EarnSurpSignal:
+    learnable = True
+    kind = "scalar"
+
+    def __init__(self, features=None, params=None):
+        p = dict(params or {})
+        self.mode, self.clip, self.shrink = p.get("mode", "sign"), float(p.get("clip", 20.0)), float(p.get("shrink", 1.0))
+        if self.mode not in ("sign", "pct"):
+            raise ValueError(f"mode 는 sign / pct 중 하나: {self.mode}")
+        self.features = ["gap_pct", "earn", "surp_sign", "surp_pct_w"]
+        self.beta, self.n_earn = 0.0, 0
+
+    def _f(self, X):
+        f = X["surp_sign"] if self.mode == "sign" else X["surp_pct_w"].clip(-self.clip, self.clip) / self.clip
+        return np.where(X["earn"].to_numpy(float) > 0, np.nan_to_num(f.to_numpy(float)), 0.0)
+
+    def fit(self, X, y_ret, y_label, seed=0):
+        f = self._f(X)
+        m = (X["earn"].to_numpy(float) > 0) & np.isfinite(X["gap_pct"].to_numpy(float))
+        rest = np.asarray(y_ret, float)[m] - X["gap_pct"].to_numpy(float)[m]
+        self.n_earn = int(m.sum())
+        if self.n_earn >= 10 and np.var(f[m]) > 0:
+            self.beta = float(np.polyfit(f[m], np.clip(rest, -RET_CLIP, RET_CLIP), 1)[0]) * self.shrink
+        return self
+
+    def predict(self, X):
+        return X["gap_pct"].to_numpy(float) + self.beta * self._f(X)
+
+    def state(self):
+        return {"beta": self.beta, "n_earn": self.n_earn, "mode": self.mode, "clip": self.clip, "shrink": self.shrink}
+
+    def load(self, st):
+        self.beta, self.n_earn, self.mode, self.clip, self.shrink = (st[k] for k in ("beta", "n_earn", "mode", "clip", "shrink"))
+        return self
+
+
 SIGNALS = {"gap": ColumnSignal, "column": ColumnSignal, "regress": RegressSignal,
-           "classify5": Classify5Signal, "decomp": DecompSignal}
+           "classify5": Classify5Signal, "decomp": DecompSignal,
+           "xgb_reg": XGBRegSignal, "xgb_cls5": XGBCls5Signal, "lstm": LSTMSignal, "gru": GRUSignal,
+           "earn_surp": EarnSurpSignal}
 
 
 # =============================================================================
@@ -1249,7 +1581,10 @@ class TextModelRegime(TercileRegime):
         self.vec_name = p.get("vectorizer", "tfidf_uni")
         self.vec_params = {k: p[k] for k in ("min_df", "max_df") if k in p}
         self.C = float(p.get("C", 1.0))
-        self.cols = (resolve_features(p.get("columns", []), extra_groups) if self.input == "columns" else ["titles_r1"])
+        self.text_col = p.get("text_col", "titles_r1")             # titles_r1 / lead_r1 / doc_r1
+        if self.text_col not in TEXT_COLS:
+            raise ValueError(f"text_col 은 {sorted(TEXT_COLS)} 중 하나: {self.text_col}")
+        self.cols = (resolve_features(p.get("columns", []), extra_groups) if self.input == "columns" else [self.text_col])
         self.var = f"textclf:{self.input}:{self.vec_name if self.input == 'text' else '+'.join(self.cols)}"
         self.model = None
 
@@ -1265,9 +1600,9 @@ class TextModelRegime(TercileRegime):
         y = np.isin(F["label"].to_numpy(int), (0, 4)).astype(int)
         clf = LogisticRegression(C=self.C, class_weight="balanced", max_iter=2000, random_state=seed)
         if self.input == "text":
-            m = F["titles_r1"].fillna("").str.len().to_numpy() > 0
+            m = F[self.text_col].fillna("").str.len().to_numpy() > 0
             self.model = make_pipeline(make_vectorizer(self.vec_name, self.vec_params), clf)
-            self.model.fit(F["titles_r1"].to_numpy()[m], y[m])
+            self.model.fit(F[self.text_col].to_numpy()[m], y[m])
         else:
             self.model = make_pipeline(SimpleImputer(strategy="median"), StandardScaler(), clf)
             self.model.fit(F[self.cols].to_numpy(float), y)
@@ -1275,7 +1610,7 @@ class TextModelRegime(TercileRegime):
 
     def values(self, X):
         if self.input == "text":
-            t = X["titles_r1"].fillna("").to_numpy()
+            t = X[self.text_col].fillna("").to_numpy()
             out = np.full(len(X), np.nan)
             m = np.array([len(s) > 0 for s in t], bool)
             if m.any():
@@ -1288,15 +1623,83 @@ class TextModelRegime(TercileRegime):
 
     def state(self):
         return {**super().state(), "model": self.model, "input": self.input, "vec_name": self.vec_name,
-                "cols": self.cols, "C": self.C}
+                "cols": self.cols, "C": self.C, "text_col": self.text_col}
 
     def load(self, st):
         super().load(st)
         self.model, self.input, self.vec_name, self.cols, self.C = st["model"], st["input"], st["vec_name"], st["cols"], st["C"]
+        self.text_col = st.get("text_col", "titles_r1")
         return self
 
 
-REGIMES = {"none": NoRegime, "tercile": TercileRegime, "linear": LinearRegime, "textclf": TextModelRegime}
+# -----------------------------------------------------------------------------
+# 기능  : H1~H4. HAR 식 선형 모형으로 "오늘 움직임 크기"를 예측하고, 그 삼분위로 갭 신호의 크기 배율을 정함
+#         방향(부호)은 갭 그대로. TextModelRegime 과 같은 구조 (prefit → 삼분위 배율)
+# 수식  : t_j = log(1 + max(x_j, 0))    (x = abs_gap, absr1, absr5, absr22, pre_rng, earn …, 결측은 fit 구간 중앙값)
+#         y   = log(min(|ret_pct|, 15) + 0.1)
+#         ŷ   = a + Σ_j b_j t_j          (OLS, Corsi 2009 HAR-RV 를 |r| 로 바꾼 것)
+#         mode "level"   values = ŷ
+#              "excess"  values = ŷ − b_gap · t_gap   (같은 |갭| 에서 갭 외 변수가 말하는 크기. abs_gap 필요)
+# loss  : 제곱오차 (OLS),  배율은 tune 구간 score 최대
+# input : params  columns (열 또는 묶음 이름), mode, f_grid
+# output: values(X) = 위 값 → 삼분위 배율 f_low / 1 / f_high
+# -----------------------------------------------------------------------------
+class MagModelRegime(TercileRegime):
+    learnable = True
+
+    def __init__(self, params=None, extra_groups=None):
+        p = dict(params or {})
+        super().__init__(p)
+        self.cols = resolve_features(p.get("columns", ["har"]), extra_groups)
+        self.mode = p.get("mode", "level")
+        if self.mode not in ("level", "excess"):
+            raise ValueError(f"mode 는 level / excess 중 하나: {self.mode}")
+        if self.mode == "excess" and "abs_gap" not in self.cols:
+            raise ValueError("mode='excess' 는 columns 에 abs_gap 이 있어야 함")
+        self.var = f"magmodel:{self.mode}:{'+'.join(self.cols)}"
+        self.med, self.coef, self.icpt = None, None, 0.0
+
+    @property
+    def inputs(self):
+        return list(self.cols)
+
+    def _t(self, X):
+        T = np.log1p(np.clip(X[self.cols].to_numpy(float), 0, None))
+        return np.where(np.isnan(T), self.med, T)
+
+    def prefit(self, F, seed=0):
+        self.med = np.nan_to_num(np.nanmedian(np.log1p(np.clip(F[self.cols].to_numpy(float), 0, None)), axis=0))
+        T = self._t(F)
+        y = np.log(np.minimum(np.abs(F["ret_pct"].to_numpy(float)), RET_CLIP) + 0.1)
+        A = np.column_stack([np.ones(len(T)), T])
+        sol = np.linalg.lstsq(A, y, rcond=None)[0]
+        self.icpt, self.coef = float(sol[0]), sol[1:]
+        return self
+
+    def values(self, X):
+        T = self._t(X)
+        v = self.icpt + T @ self.coef
+        if self.mode == "excess":
+            j = self.cols.index("abs_gap")
+            v = v - self.coef[j] * T[:, j]
+        return v
+
+    def params(self):
+        return {**super().params(), "mode": self.mode, "columns": self.cols,
+                "coef": {c: float(b) for c, b in zip(self.cols, self.coef)} if self.coef is not None else None,
+                "intercept": self.icpt}
+
+    def state(self):
+        return {**super().state(), "cols": self.cols, "mode": self.mode, "med": self.med, "coef": self.coef, "icpt": self.icpt}
+
+    def load(self, st):
+        super().load(st)
+        self.cols, self.mode, self.med, self.coef, self.icpt = st["cols"], st["mode"], st["med"], st["coef"], st["icpt"]
+        return self
+
+
+REGIMES = {"none": NoRegime, "tercile": TercileRegime, "linear": LinearRegime, "textclf": TextModelRegime,
+           "magmodel": MagModelRegime}
 
 
 # =============================================================================

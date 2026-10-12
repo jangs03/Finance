@@ -23,7 +23,7 @@ from .lockbox import LOCKBOX_START
 from .panel import calendar, universe_panel
 from .splits import universe_draws
 
-ALL_GROUPS = ["core", "scale", "cross", "event", "analyst", "news", "regime",
+ALL_GROUPS = ["core", "scale", "cross", "event", "analyst", "news", "regime", "seq", "premkt", "har", "txt_recent", "txt_body", "txt_lead",
               "txt_count", "txt_tone_gdelt", "txt_tone_lm", "txt_novelty", "txt_event", "txt_meta", "txt_text"]
 
 

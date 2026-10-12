@@ -52,7 +52,13 @@ def load_tables(with_news=False):
          "earnings": pd.read_parquet(DATA / "earnings.parquet"),
          "analyst": pd.read_parquet(DATA / "analyst.parquet")}
     if with_news:
-        t["news"] = pq.read_table(DATA / "news.parquet", columns=["known_at", "symbols", "source", "title", "tone"]).to_pandas()
+        import pyarrow.compute as pc
+        from src.model import BODY_CHARS
+        tb = pq.read_table(DATA / "news.parquet", columns=["known_at", "symbols", "source", "title", "tone", "text"])
+        # 본문은 첫 BODY_CHARS 글자만 (메모리). 같은 자르기를 text_articles 도 하므로 결과는 같음
+        tb = tb.set_column(tb.schema.get_field_index("text"), "text",
+                           pc.utf8_slice_codeunits(pc.fill_null(tb["text"], ""), 0, BODY_CHARS))
+        t["news"] = tb.to_pandas()
     return t
 
 

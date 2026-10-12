@@ -1,0 +1,63 @@
+# M4 — 뉴스 본문 (리서치 4순위)
+# 질문: 제목 대신(또는 함께) 본문 첫 문단(lead, 600 글자)을 쓰면 급등락 판단이 나아지는가?
+#   데이터: 본문은 뉴스 행의 약 7.5% 에만 있고, 비율이 시기에 따라 5.8% → 10.8% 로 변함 (출처 구성 변화)
+#   LM 사전은 아직 없고(resources/ 미배치), FinBERT 는 Colab 산출물이 필요해 이번에는 vectorizer·정규식·언급 수만 씀
+# 구조: 갭 + k 위에 크기 배율만 바꿈 (T5·M3 와 같은 구조)
+#   L: textclf(text) — 문자열 열 → TF-IDF → 로지스틱 P(급등락) → 삼분위 배율
+#   B: textclf(columns) — 본문 유무·언급 수·사건 정규식
+#   H: magmodel excess — M2 H4 에 본문 기사 수를 더함
+# lockbox 사용 후 실험이라 Holm 보정, seed 는 M1~M3 과 같음
+# 실행: uv run python -m exp run configs/m4_body.toml
+
+name = "m4_body"
+stage = "M4"
+seed = 20261011
+
+[data]
+groups = ["core", "event", "premkt", "har", "txt_count", "txt_text", "txt_body", "txt_lead"]
+
+[eval]
+baseline = "B2"
+multiplicity = "holm"
+family_size = 6
+
+[[candidates]]
+name = "B2"
+signal = { type = "gap" }
+decision = { type = "k" }
+
+[[candidates]]
+name = "L0-title"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "text", text_col = "titles_r1", vectorizer = "tfidf_uni" } }
+
+[[candidates]]
+name = "L1-lead"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "text", text_col = "lead_r1", vectorizer = "tfidf_uni" } }
+
+[[candidates]]
+name = "L2-title+lead"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "text", text_col = "doc_r1", vectorizer = "tfidf_uni" } }
+
+[[candidates]]
+name = "L3-title+lead-bi"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "text", text_col = "doc_r1", vectorizer = "tfidf_bi" } }
+
+[[candidates]]
+name = "B1-body-cols"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "textclf", params = { input = "columns", columns = ["txt_count", "txt_body"] } }
+
+[[candidates]]
+name = "H6-har+pre+body-excess"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "magmodel", params = { columns = ["har", "pre_rng", "earn", "n_body_r1"], mode = "excess" } }

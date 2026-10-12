@@ -1,0 +1,73 @@
+# M2 — 크기(급등락) 보정: 프리마켓 경로 + HAR 식 크기 예측
+# 질문: 같은 갭이라도 "오늘 크게 움직일 종목"을 골라 k 배율을 키우면 score 가 오르는가?
+#   - 방향은 갭 부호 그대로, 크기 배율만 바꿈 (E5 의 regime 보정과 같은 구조, 변수만 종목 단위)
+#   - P: 프리마켓 범위 pre_rng 를 그대로 삼분위/연속 배율에 씀
+#   - H: HAR 식 OLS 로 log|r| 을 예측 (abs_gap, absr1/5/22 [+ pre_rng, earn]) → 예측값 삼분위 배율
+#        level = 예측값 그대로,  excess = 갭 기여분을 뺀 값 (같은 갭에서 다른 변수가 말하는 크기)
+#   - G: 참고용 학습형 신호 (HGB 회귀에 같은 변수를 넣음)
+# 근거: docs 리서치 (Corsi 2009 HAR-RV, 실적·overnight 수익률이 변동성 예측을 높인다는 결과),
+#       DEV 탐색에서 같은 |갭| 5분위 안 pre_rng 상위 1/3 의 급등락 비율 29.5% → 45.8%
+# lockbox 사용 후 실험이라 Holm 보정 (family_size = 비기준선 후보 수)
+# seed 는 M1 과 같게 둬서 같은 종목 추첨에서 비교
+# 실행: uv run python -m exp run configs/m2_magnitude.toml
+
+name = "m2_magnitude"
+stage = "M2"
+seed = 20261011
+
+[data]
+groups = ["core", "event", "regime", "premkt", "har"]
+
+[eval]
+baseline = "B2"
+multiplicity = "holm"
+family_size = 7
+
+[[candidates]]
+name = "B2"
+signal = { type = "gap" }
+decision = { type = "k" }
+
+# ---- P: 프리마켓 범위 직접 사용
+[[candidates]]
+name = "P1-tercile"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "tercile", params = { var = "pre_rng" } }
+
+[[candidates]]
+name = "P2-linear"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "linear", params = { var = "pre_rng" } }
+
+# ---- H: HAR 식 크기 예측
+[[candidates]]
+name = "H1-har-level"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "magmodel", params = { columns = ["har"], mode = "level" } }
+
+[[candidates]]
+name = "H2-har-excess"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "magmodel", params = { columns = ["har"], mode = "excess" } }
+
+[[candidates]]
+name = "H3-har+pre-level"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "magmodel", params = { columns = ["har", "pre_rng", "earn"], mode = "level" } }
+
+[[candidates]]
+name = "H4-har+pre-excess"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "magmodel", params = { columns = ["har", "pre_rng", "earn"], mode = "excess" } }
+
+# ---- G: 학습형 신호 참고
+[[candidates]]
+name = "G1-hgb-mag"
+signal = { type = "regress", features = ["core", "premkt", "har", "event"] }
+decision = { type = "k", params = { k_grid = [0.5, 16.0, 0.25] } }
