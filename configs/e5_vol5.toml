@@ -1,0 +1,24 @@
+# E5 — Stock-level Volatility Ablation
+# B2 vs B2 + individual-stock vol5
+# DEV only / no Lockbox
+
+name = "e5_vol5"
+stage = "E5"
+seed = 20261005
+
+[data]
+groups = ["core", "scale"]
+
+[eval]
+baseline = "B2"
+
+[[candidates]]
+name = "B2"
+signal = { type = "gap" }
+decision = { type = "k" }
+
+[[candidates]]
+name = "B2_vol5"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "tercile", params = { var = "vol5" } }

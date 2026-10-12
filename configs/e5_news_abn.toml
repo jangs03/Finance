@@ -1,0 +1,27 @@
+# E5 - News Abnormality Ablation
+# Exploratory DEV experiment / no Lockbox
+
+name = "e5_news_abn"
+stage = "E5"
+seed = 20261005
+
+[data]
+groups = ["core", "news"]
+
+[eval]
+baseline = "B2"
+
+[adopt]
+multiplicity = "holm"
+family_size = 2  # vol5 + news_abn: 두 신규 E5 후보를 하나의 탐색 family로 취급
+
+[[candidates]]
+name = "B2"
+signal = { type = "gap" }
+decision = { type = "k" }
+
+[[candidates]]
+name = "B2_news_abn"
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "tercile", params = { var = "news_abn" } }

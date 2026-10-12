@@ -106,8 +106,8 @@ def _attach_research(x, names):
             sorted(x["symbol"].unique()),
             include_embeddings=include_embeddings
         )
-    if len(fb.columns) > 2:
-        x = x.merge(fb, on=key, how="left")
+        if len(fb.columns) > 2:
+            x = x.merge(fb, on=key, how="left")
     for name, fname in LLM_FILES.items():
         if name in names:
             path = CACHE / fname

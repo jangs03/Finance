@@ -31,6 +31,8 @@ from .metrics import evaluate
 from .panel import RESEARCH_GROUPS, load_tables, universe_panel
 from .splits import fold_masks, partition, universe_draws
 from .stats import decide, holm, paired_bootstrap
+from contextlib import nullcontext
+from exp.news_fast import skip_text_block
 
 
 def _symbols():
@@ -70,10 +72,28 @@ def run(cfg, force_lockbox=False, rerun=False):
     groups, research, extra = cfg["data"]["groups"], cfg["data"]["research"], _extra(cfg)
     preds, params, t0 = [], [], time.time()
     for dr in draws:
-        # 학습 행은 항상 DEV 만. 평가 행은 lockbox 실행일 때만 lockbox 를 포함
-        train_p = pd.concat([universe_panel(u, groups, research) for u in dr["train_universes"]], ignore_index=True)
-        test_p = universe_panel(dr["test_universe"], groups, research, allow_lockbox=use_lb)
+        # 경량 뉴스 처리는 e5_news_abn DEV 실험에만 적용
+        fast_news = (
+            cfg["name"] == "e5_news_abn"
+            and not use_lb
+            and "news" in groups
+        )
+
+        with (skip_text_block() if fast_news else nullcontext()):
+            train_p = pd.concat(
+                [universe_panel(u, groups, research) for u in dr["train_universes"]],
+                ignore_index=True,
+            )
+            test_p = universe_panel(
+                dr["test_universe"],
+                groups,
+                research,
+                allow_lockbox=use_lb,
+            )
+
         test_p["seen"] = test_p["symbol"].isin(dr["seen_test"])
+
+
         for fold in folds:
             trm, tem = fold_masks(train_p, test_p, fold, sp["embargo_days"])
             tr, te = train_p[trm], test_p[tem].reset_index(drop=True)
