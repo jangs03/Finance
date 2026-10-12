@@ -14,7 +14,16 @@ groups = ["core", "scale", "cross", "event", "regime"]
 [export]
 train_until = "2100-01-01"       # 전체 기간. lockbox 평가(E6) 전에는 export 가 거부함 (exp/lockbox.py)
 
-# E6 판정 규칙에 따라 둘 중 하나를 --candidate 로 고름
+# 2026-10-12: 최종 모델 = 팀원 E5 B2_vol5 (configs/e5_vol5.toml). M6 사전 등록 규칙(seed 5개 모두 Δ>0)을 통과
+#   기존 seed 5개 + 새 seed 5개 = 10/10 양수 (평균 약 +0.007). lockbox 사용 이후 DEV 근거 결정 (lockbox 재평가 없음)
+#   실행: python -m exp export configs/final.toml --candidate final_vol5
+[[candidates]]
+name = "final_vol5"              # = E5 B2_vol5
+signal = { type = "gap" }
+decision = { type = "k" }
+regime = { type = "tercile", params = { var = "vol5" } }
+
+# (이전) E6 판정 규칙에 따라 둘 중 하나를 --candidate 로 고름
 #   lockbox Δ(final − baseline) ≥ 0 → --candidate final
 #   lockbox Δ < 0                   → --candidate baseline
 [[candidates]]

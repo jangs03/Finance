@@ -12,14 +12,19 @@
 import functools
 import hashlib
 import json
-from tkinter.font import names
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
 from src.data import START, label_of
+import src.model as _M
 from src.model import GROUP_TABLES, NS, build_features
+
+# build_features 가 부르는 feature 함수의 원본 (import 시점). 실행 중에 교체되면(예: exp/news_fast.skip_text_block)
+# 캐시 키를 따로 써서, 일부 feature 가 빠진 패널이 일반 실험의 캐시로 재사용되지 않게 함
+_FEATURE_FNS = {n: getattr(_M, n) for n in ("_daily_block", "_extended_hours", "_premarket_range", "_earnings_block",
+                                            "_analyst_block", "_news_block", "_text_block") if hasattr(_M, n)}
 
 from .config import CACHE, ROOT, fingerprint
 from .lockbox import dev_only
@@ -139,13 +144,25 @@ def _research_stamp(name):
 #         rest = log(1 + ret) − log(1 + gap)   (갭 이후 움직임, 분석용. feature 로 쓰지 않음)
 # 캐시  : exp/cache/panel_<key>.parquet,  key = sha256(universe, 뉴스 여부, research, 코드·데이터 지문)
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 기능  : 패널 캐시 키. 평소에는 (universe, 뉴스 여부, 연구 파일, 코드·데이터 지문) 으로 정함
+#         feature 함수가 실행 중에 교체됐으면 그 사실을 키에 더함 (교체가 없으면 키는 이전과 같아 기존 캐시 그대로 씀)
+# output: 16자리 hex
+# -----------------------------------------------------------------------------
+def _cache_key(universe, with_news, stamps, fp):
+    parts = [universe, with_news, stamps, fp]
+    patched = sorted(n for n, f in _FEATURE_FNS.items() if getattr(_M, n) is not f)
+    if patched:
+        parts.append({"patched": [f"{n}:{getattr(getattr(_M, n), '__qualname__', '?')}" for n in patched]})
+    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:16]
+
+
 def universe_panel(universe, groups=(), research=(), allow_lockbox=False):
     universe = sorted(universe)
     with_news = any("news" in GROUP_TABLES.get(g, ()) for g in groups)
     fp = fingerprint()
     stamps = [(n, _research_stamp(n)) for n in sorted(research)]     # 연구 결과 파일이 바뀌면 캐시도 새로
-    key = hashlib.sha256(json.dumps([universe, with_news, stamps, fp], sort_keys=True).encode()).hexdigest()[:16]
-    path = CACHE / f"panel_{key}.parquet"
+    path = CACHE / f"panel_{_cache_key(universe, with_news, stamps, fp)}.parquet"
     if path.exists():
         return dev_only(pd.read_parquet(path), allow_lockbox)
     tables = load_tables(with_news)

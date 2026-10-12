@@ -1,0 +1,127 @@
+{
+  "candidate": "final_vol5",
+  "spec": {
+    "signal": {
+      "type": "gap"
+    },
+    "decision": {
+      "type": "k"
+    },
+    "regime": {
+      "type": "tercile",
+      "params": {
+        "var": "vol5"
+      }
+    },
+    "selection": {
+      "criterion": "pooled"
+    },
+    "tune_frac": 0.2,
+    "tune_on": "auto",
+    "seed": 1503606406,
+    "name": "final_vol5"
+  },
+  "params": {
+    "decision": {
+      "bounds": [
+        -0.45454545454545453,
+        -0.10909090909090909,
+        0.10909090909090909,
+        0.45454545454545453
+      ],
+      "k": 5.5
+    },
+    "regime": {
+      "var": "vol5",
+      "edges": [
+        1.116052187106377,
+        1.866711390384316
+      ],
+      "f": [
+        1.3,
+        1.0,
+        0.7
+      ]
+    },
+    "n_fit": 0,
+    "n_tune": 26100,
+    "tune_from": "2024-08-14"
+  },
+  "train_rows": 26100,
+  "train_until": "2100-01-01",
+  "config": "configs\\final.toml",
+  "config_hash": "644dd145d291",
+  "universes": [
+    [
+      "AMGN",
+      "AVGO",
+      "BKNG",
+      "COST",
+      "CSCO",
+      "CVS",
+      "DE",
+      "DHR",
+      "GE",
+      "INTC",
+      "LLY",
+      "MS",
+      "NFLX",
+      "TJX",
+      "UBER",
+      "V",
+      "XOM"
+    ],
+    [
+      "ADI",
+      "AMD",
+      "AMZN",
+      "AXP",
+      "CB",
+      "DELL",
+      "GILD",
+      "IBKR",
+      "KO",
+      "MCD",
+      "NEM",
+      "ORCL",
+      "PM",
+      "TMO",
+      "UNP",
+      "VZ",
+      "WELL"
+    ],
+    [
+      "BA",
+      "BRK-B",
+      "COP",
+      "CRM",
+      "GLW",
+      "GS",
+      "JNJ",
+      "LIN",
+      "MSFT",
+      "NOW",
+      "PFE",
+      "PLD",
+      "QCOM",
+      "RTX",
+      "TMUS",
+      "WMT"
+    ]
+  ],
+  "env": {
+    "python": "3.11.9",
+    "platform": "Windows-10-10.0.26300-SP0",
+    "packages": {
+      "numpy": "2.4.6",
+      "pandas": "3.0.6",
+      "pyarrow": "25.0.1",
+      "scikit-learn": "1.9.1",
+      "anthropic": null
+    },
+    "git_commit": "9957c20125b47cc11de933bda444e02e46d3b727",
+    "git_dirty": true,
+    "code": "2353a51f528d",
+    "data": "23015d0176bd"
+  }
+}
